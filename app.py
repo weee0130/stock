@@ -41,25 +41,19 @@ def calculate_indicators(df, window=20, std_dev=2):
     except:
         return None
 
-# --- 2. 抓取「上市股票」清單 (修正 SSL 驗證與編碼) ---
+# --- 2. 抓取「上市股票」清單 ---
 @st.cache_data(ttl=3600)
 def get_tw_listed_stocks():
     try:
         url = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-        # verify=False 解決雲端環境 SSL 憑證失效問題
+        headers = {'User-Agent': 'Mozilla/5.0'}
         res = requests.get(url, headers=headers, verify=False, timeout=20)
         res.encoding = 'big5'
-        
         df = pd.read_html(res.text)[0]
         df.columns = df.iloc[0]
         df = df.iloc[2:]
-        
         codes = []
         full_space = '\u3000'
-        
         for item in df['有價證券代號及名稱']:
             item_str = str(item)
             code = item_str.split(full_space)[0].strip()
@@ -67,49 +61,40 @@ def get_tw_listed_stocks():
                 codes.append(f"{code}.TW")
         return codes
     except Exception as e:
-        st.error(f"清單抓取失敗，改用預設清單。錯誤: {e}")
-        return ["2330.TW", "2317.TW", "2454.TW", "2382.TW", "3231.TW", "2303.TW", "2603.TW"]
+        return ["2330.TW", "2317.TW", "2454.TW", "2382.TW", "3231.TW"]
 
 # --- 3. 核心選股邏輯 ---
 def scan_logic(symbol, params):
     try:
-        # 下載 100 天日線
         df = yf.download(symbol, period="100d", interval="1d", progress=False, threads=False, timeout=10)
         if df is None or len(df) < 40: return None
-        
         df = calculate_indicators(df)
         if df is None: return None
         
         last = df.iloc[-1]
         prev = df.iloc[-2]
 
-        # 1. 盤整期帶寬平均值
-        history_bw = df['bandwidth'].iloc[-(params['settle_days']+1):-1]
-        avg_bw = float(history_bw.mean())
-        
-        # 2. 突破判斷
+        avg_bw = float(df['bandwidth'].iloc[-(params['settle_days']+1):-1].mean())
         price_break = float(last['Close']) > float(last['UP'])
 
-        # 3. 過濾條件
         vol_ok = (float(last['Volume']) > (float(last['Vol_MA5']) * params['vol_ratio'])) if params['use_vol'] else True
         open_ok = (float(last['UP']) > float(prev['UP']) and float(last['DN']) < float(prev['DN'])) if params['use_open'] else True
         macd_ok = float(last['Hist']) > 0 if params['use_macd'] else True
 
         if avg_bw < (params['bw_limit']/100) and price_break and vol_ok and open_ok and macd_ok:
             return {
-                "symbol": symbol,
+                "symbol": symbol, "pure_code": symbol.split('.')[0],
                 "price": round(float(last['Close']), 2),
                 "vol_ratio": round(float(last['Volume']/last['Vol_MA5']), 2),
-                "avg_bw": f"{round(avg_bw*100, 2)}%",
-                "df": df
+                "avg_bw": f"{round(avg_bw*100, 2)}%", "df": df
             }
     except:
         pass
     return None
 
 # --- 4. Streamlit UI ---
-st.set_page_config(page_title="台股全能突破篩選器", layout="wide")
-st.title("🏹 台股上市股票「全能突破」深度篩選")
+st.set_page_config(page_title="台股大戶+技術面全能篩選", layout="wide")
+st.title("🏹 台股全市場「大戶潛伏+窄布林突破」精選系統")
 
 with st.sidebar:
     st.header("⚙️ 篩選策略參數")
@@ -120,28 +105,21 @@ with st.sidebar:
     st.header("🛡️ 進階過濾開關")
     use_vol = st.toggle("帶量突破 (成交量放大)", value=True)
     vol_ratio = st.slider("放量倍數", 1.0, 3.0, 1.5) if use_vol else 1.0
-    
-    use_open = st.toggle("布林張口 (喇叭口開花)", value=True)
-    use_macd = st.toggle("MACD 強勢 (紅柱轉正)", value=True)
+    use_open = st.toggle("布林張口 (向上變盤)", value=True)
+    use_macd = st.toggle("MACD 強勢 (多頭確認)", value=True)
     
     st.divider()
-    stock_limit = st.number_input("掃描上市股票數量 (最高 1500)", 10, 1500, 1500)
+    stock_limit = st.number_input("掃描上市股票數量", 10, 1500, 1500)
 
-params = {
-    "bw_limit": bw_limit, "settle_days": settle_days, "use_vol": use_vol,
-    "vol_ratio": vol_ratio, "use_open": use_open, "use_macd": use_macd
-}
-
-if st.button("🚀 開始全上市市場大掃描"):
+if st.button("🚀 開始深度精選掃描 (含籌碼外部連結)"):
     all_listed = get_tw_listed_stocks()
     target_list = all_listed[:stock_limit]
-    
     hits = []
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    # 使用 ThreadPoolExecutor 同步下載提升效率
     with ThreadPoolExecutor(max_workers=10) as executor:
+        params = {"bw_limit": bw_limit, "settle_days": settle_days, "use_vol": use_vol, "vol_ratio": vol_ratio, "use_open": use_open, "use_macd": use_macd}
         futures = [executor.submit(scan_logic, s, params) for s in target_list]
         for i, future in enumerate(futures):
             res = future.result()
@@ -149,25 +127,30 @@ if st.button("🚀 開始全上市市場大掃描"):
             progress_bar.progress((i + 1) / len(target_list))
             status_text.text(f"掃描進度： {i+1}/{len(target_list)}")
 
-    st.divider()
     if hits:
-        st.success(f"🎉 找到 {len(hits)} 檔符合條件的標的！")
+        st.success(f"🎉 發現 {len(hits)} 檔精選標的！請點擊展開並確認大戶籌碼。")
         for hit in hits:
             with st.expander(f"💎 {hit['symbol']} | 價: {hit['price']} | 量增: {hit['vol_ratio']}倍 | 盤整度: {hit['avg_bw']}"):
+                # 建立外部連結按鈕
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    # 玩股網的大戶持股頁面
+                    st.link_button("📊 檢查大戶持股 (玩股網)", f"https://www.wantgoo.com/stock/{hit['pure_code']}/major-holders")
+                with col2:
+                    # 財報狗的籌碼分佈
+                    st.link_button("🕵️ 查看籌碼分佈 (財報狗)", f"https://statementdog.com/analysis/{hit['pure_code']}/equity-distribution")
+                with col3:
+                    st.link_button("📰 Yahoo 股市新聞", f"https://tw.stock.yahoo.com/quote/{hit['symbol']}")
+                
+                # 繪圖
                 df_p = hit['df'].tail(60)
                 fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
-                
-                # K線與布林
                 fig.add_trace(go.Candlestick(x=df_p.index, open=df_p['Open'], high=df_p['High'], low=df_p['Low'], close=df_p['Close'], name="K線"), row=1, col=1)
                 fig.add_trace(go.Scatter(x=df_p.index, y=df_p['UP'], name="上軌", line=dict(color='red', width=1.5)), row=1, col=1)
                 fig.add_trace(go.Scatter(x=df_p.index, y=df_p['DN'], name="下軌", line=dict(color='blue', width=1.5)), row=1, col=1)
-                fig.add_trace(go.Scatter(x=df_p.index, y=df_p['MB'], name="20MA", line=dict(color='orange', dash='dash')), row=1, col=1)
-                
-                # MACD
                 colors = ['red' if val > 0 else 'green' for val in df_p['Hist']]
                 fig.add_trace(go.Bar(x=df_p.index, y=df_p['Hist'], name="MACD柱狀體", marker_color=colors), row=2, col=1)
-                
-                fig.update_layout(xaxis_rangeslider_visible=False, height=600, margin=dict(l=10, r=10, b=10, t=30), hovermode="x unified")
+                fig.update_layout(xaxis_rangeslider_visible=False, height=550, margin=dict(l=10, r=10, b=10, t=30), hovermode="x unified")
                 st.plotly_chart(fig, use_container_width=True)
     else:
-        st.warning("查無符合條件標的，請放寬參數或增加掃描量。")
+        st.warning("查無標的，請放寬參數後再試。")
