@@ -14,7 +14,6 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # --- 1. 技術指標計算 ---
 def calculate_indicators(df, window=20, std_dev=2):
     try:
-        # 處理 yfinance 可能回傳的多層索引
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         
@@ -22,17 +21,13 @@ def calculate_indicators(df, window=20, std_dev=2):
             df[col] = pd.to_numeric(df[col], errors='coerce')
         df = df.dropna(subset=['Close'])
 
-        # 布林通道
         df['MB'] = df['Close'].rolling(window=window).mean()
         df['STD'] = df['Close'].rolling(window=window).std()
         df['UP'] = df['MB'] + (std_dev * df['STD'])
         df['DN'] = df['MB'] - (std_dev * df['STD'])
         df['bandwidth'] = (df['UP'] - df['DN']) / df['MB']
-        
-        # 成交量均線
         df['Vol_MA5'] = df['Volume'].rolling(window=5).mean()
 
-        # MACD
         exp1 = df['Close'].ewm(span=12, adjust=False).mean()
         exp2 = df['Close'].ewm(span=26, adjust=False).mean()
         df['MACD'] = exp1 - exp2
@@ -43,15 +38,17 @@ def calculate_indicators(df, window=20, std_dev=2):
     except:
         return None
 
-# --- 2. 抓取「上市股票」清單 (修正過濾與計數邏輯) ---
+# --- 2. 抓取「上市股票」清單 (增加防錯邏輯) ---
 @st.cache_data(ttl=3600)
 def get_tw_listed_stocks_clean():
     try:
         url = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"
-        headers = {'User-Agent': 'Mozilla/5.0'}
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
         res = requests.get(url, headers=headers, verify=False, timeout=20)
         res.encoding = 'big5'
-        df = pd.read_html(res.text)[0]
+        
+        df_list = pd.read_html(res.text)
+        df = df_list[0]
         df.columns = df.iloc[0]
         df = df.iloc[2:]
         
@@ -64,19 +61,19 @@ def get_tw_listed_stocks_clean():
                 parts = item_str.split(full_space)
                 code = parts[0].strip()
                 name = parts[1].strip()
-                # 嚴格篩選：4 碼純數字 (確保是普通股，避開權證、ETF等)
                 if len(code) == 4 and code.isdigit():
                     full_name_map[f"{code}.TW"] = name
                     
+        if not full_name_map:
+            raise ValueError("抓取清單為空")
         return full_name_map
     except Exception as e:
-        st.error(f"清單抓取錯誤: {e}")
-        return {"2330.TW": "台積電", "2317.TW": "鴻海"}
+        # 如果抓取失敗，回傳一組基本的預設值，避免 number_input 報錯
+        return {"2330.TW": "台積電", "2317.TW": "鴻海", "2454.TW": "聯發科", "2382.TW": "廣達", "2303.TW": "聯電"}
 
 # --- 3. 核心選股邏輯 ---
 def scan_logic(symbol, name, params):
     try:
-        # 下載 180 天確保長週期計算
         df = yf.download(symbol, period="180d", interval="1d", progress=False, threads=False, timeout=10)
         if df is None or len(df) < (params['settle_days'] + 20):
             return None
@@ -87,11 +84,9 @@ def scan_logic(symbol, name, params):
         last = df.iloc[-1]
         prev = df.iloc[-2]
 
-        # 盤整天數邏輯 (交易日)
         history_bw = df['bandwidth'].iloc[-(params['settle_days']+1):-1]
         avg_bw = float(history_bw.mean())
         
-        # 條件判斷
         price_break = float(last['Close']) > float(last['UP'])
         vol_ok = (float(last['Volume']) > (float(last['Vol_MA5']) * params['vol_ratio'])) if params['use_vol'] else True
         open_ok = (float(last['UP']) > float(prev['UP']) and float(last['DN']) < float(prev['DN'])) if params['use_open'] else True
@@ -113,6 +108,10 @@ def scan_logic(symbol, name, params):
 st.set_page_config(page_title="台股長週期選股系統", layout="wide")
 st.title("🏹 台股「長週期橫盤突破」量化篩選器")
 
+# 獲取清單
+name_map = get_tw_listed_stocks_clean()
+total_listed = len(name_map)
+
 with st.sidebar:
     st.header("⚙️ 盤整參數 (交易日)")
     bw_limit = st.slider("盤整期帶寬 (%)", 3.0, 15.0, 10.0)
@@ -126,10 +125,16 @@ with st.sidebar:
     use_macd = st.toggle("MACD 紅柱", value=True)
     
     st.divider()
-    # 這裡會顯示目前市場上真正符合「上市股票」定義的總數
-    name_map = get_tw_listed_stocks_clean()
-    total_listed = len(name_map)
-    stock_limit = st.number_input(f"掃描數量 (上市總數: {total_listed})", 10, total_listed, total_listed)
+    # 修正處：確保 min_value 不會大於 max_value
+    min_val = 1
+    max_val = max(min_val + 1, total_listed) # 確保最大值至少比最小值大
+    
+    stock_limit = st.number_input(
+        f"掃描數量 (上市總數: {total_listed})", 
+        min_value=min_val, 
+        max_value=max_val, 
+        value=max_val
+    )
 
 if st.button("🚀 開始掃描"):
     target_list = list(name_map.keys())[:stock_limit]
@@ -154,7 +159,6 @@ if st.button("🚀 開始掃描"):
 
     if hits:
         st.success(f"🎉 找到 {len(hits)} 檔符合條件標的！")
-        # 製作下載 CSV
         download_df = pd.DataFrame(hits).drop(columns=['df'])
         csv = download_df.to_csv(index=False).encode('utf-8-sig')
         st.download_button("📥 下載篩選清單", data=csv, file_name=f"scan_{datetime.now().strftime('%m%d')}.csv", mime='text/csv')
@@ -177,4 +181,4 @@ if st.button("🚀 開始掃描"):
                 fig.update_layout(xaxis_rangeslider_visible=False, height=550, margin=dict(l=10, r=10, b=10, t=30), hovermode="x unified")
                 st.plotly_chart(fig, use_container_width=True)
     else:
-        st.warning("查無標的，建議放寬「盤整期帶寬」或減少「維持窄幅天數」。")
+        st.warning("查無標的，請放寬過濾條件後再試。")
