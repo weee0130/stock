@@ -3,5 +3,5 @@ yfinance
 pandas
 plotly
 requests
-lxml
 html5lib
+lxml
