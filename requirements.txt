@@ -5,3 +5,7 @@ plotly
 requests
 html5lib
 lxml
+streamlit
+pandas
+shioaji  # 或是 finmind, fugle-marketdata
+requests
